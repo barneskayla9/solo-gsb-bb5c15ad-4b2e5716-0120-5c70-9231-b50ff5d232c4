@@ -316,7 +316,10 @@ class App:
             if item is None:
                 raise LookupError("物品不存在")
             claims = repository.list_claims_for_item(self.conn(), int(parts[0]))
-            return self.html(render.staff_item_detail(item, claims, self.csrf_token(req), flash))
+            corrections = repository.list_corrections(self.conn(), int(parts[0]))
+            return self.html(
+                render.staff_item_detail(item, claims, self.csrf_token(req), flash, corrections)
+            )
 
         if m == "POST" and (parts := _match("/staff/items/{id}/remove", p)):
             if not self.check_csrf(req):
@@ -340,6 +343,9 @@ class App:
 
         if m == "POST" and (parts := _match("/staff/claims/{id}/resend", p)):
             return self.resend_code(req, int(parts[0]))
+
+        if m == "POST" and (parts := _match("/staff/claims/{id}/correct", p)):
+            return self.correct_claim(req, int(parts[0]))
 
         if p == "/staff/verify" and m == "GET":
             return self.html(render.staff_verify_form(self.csrf_token(req), flash))
@@ -397,9 +403,17 @@ class App:
         if claim is None:
             raise LookupError("申请不存在")
         active = repository.get_active_code_for_claim(self.conn(), claim_id)
+        claims = repository.list_claims_for_item(self.conn(), claim["item_id"])
+        corrections = repository.list_corrections(self.conn(), claim["item_id"])
         return self.html(
             render.staff_claim_detail(
-                claim, active, self.csrf_token(req), flash, plain_code=self._plain_code(active)
+                claim,
+                active,
+                self.csrf_token(req),
+                flash,
+                plain_code=self._plain_code(active),
+                claims=claims,
+                corrections=corrections,
             )
         )
 
@@ -420,6 +434,31 @@ class App:
         except ValueError as exc:
             return Response.redirect(f"/staff/claims/{claim_id}", ("err", str(exc)))
         return Response.redirect(f"/staff/claims/{claim_id}", ("ok", "已重发新交还码，旧码立即失效。"))
+
+    def correct_claim(self, req: Request, claim_id: int) -> Response:
+        if not self.check_csrf(req):
+            return self.bad_csrf()
+        form = req.form()
+        to_claim_id = form.get("to_claim_id", "").strip()
+        reason = form.get("reason", "").strip()
+        if not reason:
+            return Response.redirect(f"/staff/claims/{claim_id}", ("err", "更正理由不能为空。"))
+        if len(reason) > 2000:
+            return Response.redirect(f"/staff/claims/{claim_id}", ("err", "更正理由超出长度限制。"))
+        try:
+            target_id = int(to_claim_id)
+        except ValueError:
+            return Response.redirect(f"/staff/claims/{claim_id}", ("err", "目标申请编号不正确。"))
+        try:
+            repository.correct_claim(
+                self.conn(), claim_id, target_id, reason, self.code_ttl, self.secret
+            )
+        except ValueError as exc:  # 物品已撤下/交还、非同物品、原申请已非获选等
+            return Response.redirect(f"/staff/claims/{claim_id}", ("err", str(exc)))
+        return Response.redirect(
+            f"/staff/claims/{target_id}",
+            ("ok", f"已改判：原申请 #{claim_id} 变为未获选，申请 #{target_id} 获选并已签发新交还码。"),
+        )
 
     def verify_code(self, req: Request) -> Response:
         if not self.check_csrf(req):

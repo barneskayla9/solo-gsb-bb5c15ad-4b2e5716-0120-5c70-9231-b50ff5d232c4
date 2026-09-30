@@ -67,7 +67,7 @@ h2{font-size:17px;margin:0 0 10px}
 table{width:100%;border-collapse:collapse;font-size:14px}
 th,td{border-bottom:1px solid var(--line);padding:9px 8px;text-align:left;vertical-align:top}
 th{color:var(--muted);font-weight:600;font-size:12px}
-input[type=text],input[type=password],input[type=email],textarea{
+input[type=text],input[type=password],input[type=email],select,textarea{
 width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:7px;
 font:inherit;font-size:14px;background:#fff}
 textarea{min-height:74px;resize:vertical}
@@ -318,7 +318,11 @@ def staff_dashboard(items: list[Any], csrf_token: str) -> str:
 
 
 def staff_item_detail(
-    item: Any, claims: list[Any], csrf_token: str, flash: tuple[str, str] | None = None
+    item: Any,
+    claims: list[Any],
+    csrf_token: str,
+    flash: tuple[str, str] | None = None,
+    corrections: list[Any] | None = None,
 ) -> str:
     actions = ""
     if item["status"] == "kept":
@@ -358,7 +362,8 @@ def staff_item_detail(
       <h1>认领申请（含私密答案与联系方式，仅工作人员可见）</h1>
       <table><thead><tr><th>申请</th><th>状态</th><th>辨认答案</th><th>联系方式</th><th>提交时间</th></tr></thead>
       <tbody>{rows}</tbody></table>
-    </div>"""
+    </div>
+    {_corrections_card(corrections)}"""
     return page(f"物品 #{item['id']}", body, staff=True, flash=flash)
 
 
@@ -369,6 +374,8 @@ def staff_claim_detail(
     flash: tuple[str, str] | None = None,
     *,
     plain_code: str | None = None,
+    claims: list[Any] | None = None,
+    corrections: list[Any] | None = None,
 ) -> str:
     select_btn = ""
     if claim["status"] == "pending" and claim["item_status"] == "kept":
@@ -380,6 +387,7 @@ def staff_claim_detail(
     code_panel = "<p class=\"muted\">尚未选定，暂无交还码。</p>"
     if claim["status"] == "selected":
         code_panel = _code_panel(claim, active_code, csrf_token, plain_code)
+    correction_form = _correction_form(claim, claims or [], csrf_token)
     body = f"""
     <div class="card">
       <h1>申请 #{claim['id']} {claim_badge(claim['status'])}</h1>
@@ -394,8 +402,69 @@ def staff_claim_detail(
       </dl>
       <div class="row">{select_btn}<a class="btn secondary" href="/staff/items/{claim['item_id']}">返回物品</a></div>
     </div>
-    <div class="card"><h1>一次性交还码</h1>{code_panel}</div>"""
+    <div class="card"><h1>一次性交还码</h1>{code_panel}</div>
+    {correction_form}
+    {_corrections_card(corrections)}"""
     return page(f"申请 #{claim['id']}", body, staff=True, flash=flash)
+
+
+def _correction_form(claim: Any, claims: list[Any], csrf_token: str) -> str:
+    """已获选申请且物品仍保管中时，提供「误选改判」表单。
+
+    目标下拉只列同一物品的其他「未获选」申请；物品已撤下 / 交还则不提供。
+    """
+    if claim["status"] != "selected" or claim["item_status"] != "kept":
+        return ""
+    options = "".join(
+        f'<option value="{c["id"]}">#{c["id"]} 未获选 · {e(c["answer"])[:60]}'
+        f"（{e(c['contact'])}）</option>"
+        for c in claims
+        if c["id"] != claim["id"] and c["status"] == "rejected"
+    )
+    if not options:
+        return (
+            '<div class="card"><h1>误选改判</h1>'
+            '<p class="muted">同一物品没有其他「未获选」申请，暂无可改判目标。</p></div>'
+        )
+    body = f"""
+    <div class="card">
+      <h1>误选改判（改判给另一份申请）</h1>
+      <p class="muted">仅在物品仍保管中、尚未交还时可用。改判后本申请变为「未获选」，
+      其所有未核销交还码立即失效；目标申请变为「已获选」并签发一枚新的一次性交还码。
+      双方原有查询凭证仍只显示本人最新状态，新码仅新获选人可见。</p>
+      <form method="post" action="/staff/claims/{claim['id']}/correct"
+        onsubmit="return confirm('改判后原申请的未核销交还码立即失效，并为新获选人签发新码。确定？')">
+        {csrf_field(csrf_token)}
+        <label for="to_claim_id">改判目标（同一物品的未获选申请）</label>
+        <select id="to_claim_id" name="to_claim_id" required>{options}</select>
+        <label for="reason">更正理由（必填，留痕供追溯）</label>
+        <textarea id="reason" name="reason" required maxlength="2000"
+          placeholder="例如：经再次核对私密特征，原获选人描述不符，另一份申请与物品一致"></textarea>
+        <div class="row"><button class="btn danger" type="submit">确认改判并签发新码</button></div>
+      </form>
+    </div>"""
+    return body
+
+
+def _corrections_card(corrections: list[Any] | None) -> str:
+    if not corrections:
+        return ""
+    rows = "".join(
+        "<tr>"
+        f'<td><a href="/staff/claims/{cr["from_claim_id"]}">#{cr["from_claim_id"]}</a></td>'
+        f'<td><a href="/staff/claims/{cr["to_claim_id"]}">#{cr["to_claim_id"]}</a></td>'
+        f"<td>{e(cr['reason'])}</td>"
+        f"<td>{fmt_time(cr['created_at'])}</td>"
+        "</tr>"
+        for cr in corrections
+    )
+    body = f"""
+    <div class="card">
+      <h1>改判记录（仅工作人员可见）</h1>
+      <table><thead><tr><th>原获选申请</th><th>改判获选申请</th><th>更正理由</th><th>时间</th></tr></thead>
+      <tbody>{rows}</tbody></table>
+    </div>"""
+    return body
 
 
 def _code_panel(claim: Any, active_code: Any, csrf_token: str, plain_code: str | None) -> str:

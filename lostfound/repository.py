@@ -205,6 +205,122 @@ def select_claim(conn: sqlite3.Connection, claim_id: int, code_ttl_seconds: int,
     return code
 
 
+# ----------------------------------------------------------------- 改判
+
+def list_corrections(conn: sqlite3.Connection, item_id: int) -> list[sqlite3.Row]:
+    """物品的改判记录（工作人员追溯用），含申请双方的答案摘要。"""
+    return conn.execute(
+        """
+        SELECT cr.*,
+               cf.answer AS from_answer, cf.contact AS from_contact,
+               ct.answer AS to_answer,   ct.contact AS to_contact
+        FROM corrections cr
+        JOIN claims cf ON cf.id = cr.from_claim_id
+        JOIN claims ct ON ct.id = cr.to_claim_id
+        WHERE cr.item_id = ?
+        ORDER BY cr.id DESC
+        """,
+        (item_id,),
+    ).fetchall()
+
+
+def correct_claim(
+    conn: sqlite3.Connection,
+    from_claim_id: int,
+    to_claim_id: int,
+    reason: str,
+    code_ttl_seconds: int,
+    key: bytes,
+) -> str:
+    """改判：把原获选申请改判给同一物品的另一份既有「未获选」申请。
+
+    仅在单一 IMMEDIATE 事务内做全部判断与状态变更，保证并发安全：
+      - 物品必须仍保管中（未撤下、未交还）；
+      - 原申请必须仍为 selected，目标申请必须为 rejected 且属同一物品；
+      - 原申请全部未核销交还码立即失效，并为新获选人签发一枚一次性新码；
+      - 落库一条改判记录（申请双方、理由、时间）。
+    与重发 / 撤下 / 核码 / 另一改判并发时，所有写操作经 IMMEDIATE 串行化，
+    条件 UPDATE 只有在前置条件仍成立时 rowcount=1，至多一次状态变更生效。
+    """
+    reason = reason.strip()
+    if not reason:
+        raise ValueError("更正理由不能为空")
+    if len(reason) > 2000:
+        raise ValueError("更正理由超出长度限制")
+    try:
+        to_claim_id = int(to_claim_id)
+    except (TypeError, ValueError):
+        raise ValueError("目标申请编号不正确")
+    if to_claim_id == from_claim_id:
+        raise ValueError("目标申请不能与原获选申请相同")
+
+    ts = now_iso()
+    expires = (
+        datetime.now(timezone.utc) + timedelta(seconds=code_ttl_seconds)
+    ).replace(microsecond=0).isoformat()
+    code = security.new_handover_code()
+
+    with immediate_tx(conn):
+        src = conn.execute(
+            """
+            SELECT c.id, c.status, c.item_id, i.status AS item_status
+            FROM claims c JOIN items i ON i.id = c.item_id
+            WHERE c.id = ?
+            """,
+            (from_claim_id,),
+        ).fetchone()
+        if src is None:
+            raise LookupError("原获选申请不存在")
+        dst = conn.execute(
+            "SELECT id, status, item_id FROM claims WHERE id = ?", (to_claim_id,)
+        ).fetchone()
+        if dst is None:
+            raise LookupError("目标申请不存在")
+
+        if src["item_status"] != "kept":
+            raise ValueError("物品已撤下或已交还，不能改判")
+        if src["status"] != "selected":
+            raise ValueError("原申请当前不是已获选状态，不能改判")
+        if dst["item_id"] != src["item_id"]:
+            raise ValueError("目标申请不属于同一物品，不能改判")
+        if dst["status"] != "rejected":
+            raise ValueError("目标申请必须为未获选状态")
+
+        # 原子条件翻转：只有当前状态符合预期才生效（抵御并发改判）。
+        cur = conn.execute(
+            "UPDATE claims SET status = 'rejected', decided_at = ?"
+            " WHERE id = ? AND status = 'selected'",
+            (ts, from_claim_id),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("原申请已非获选状态，改判未生效")
+        cur = conn.execute(
+            "UPDATE claims SET status = 'selected', decided_at = ?"
+            " WHERE id = ? AND status = 'rejected' AND item_id = ?",
+            (ts, to_claim_id, src["item_id"]),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("目标申请状态异常，回滚本次改判")
+
+        # 原获选人的未核销交还码立即失效（已核销的仅保留历史，不再有效）。
+        conn.execute(
+            "UPDATE handover_codes SET invalidated_at = ?"
+            " WHERE claim_id = ? AND consumed_at IS NULL AND invalidated_at IS NULL",
+            (ts, from_claim_id),
+        )
+        conn.execute(
+            "INSERT INTO handover_codes (claim_id, code_hash, code_enc, issued_at, expires_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (to_claim_id, security.sha256_hex(code), security.encrypt_field(key, code), ts, expires),
+        )
+        conn.execute(
+            "INSERT INTO corrections (item_id, from_claim_id, to_claim_id, reason, created_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (src["item_id"], from_claim_id, to_claim_id, reason, ts),
+        )
+    return code
+
+
 # ----------------------------------------------------------------- 交还码
 
 def get_active_code_for_claim(conn: sqlite3.Connection, claim_id: int) -> sqlite3.Row | None:
